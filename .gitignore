@@ -1,0 +1,4 @@
+node_modules/
+dist/
+raycast/my-tickets/raycast-env.d.ts
+.DS_Store

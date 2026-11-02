@@ -1,0 +1,50 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "my-tickets",
+  "title": "My Tickets",
+  "description": "Linear tickets with their opencode session status; Enter jumps to the session via oc-goto.",
+  "icon": "icon.png",
+  "author": "bogdan_culda",
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "my-tickets",
+      "title": "My Tickets",
+      "subtitle": "Linear → opencode",
+      "description": "My open Linear issues (type to search all), Enter jumps to the ticket's opencode session.",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "linearApiKey",
+      "title": "Linear API key",
+      "description": "Optional. Defaults to LINEAR_API_KEY from your login shell.",
+      "type": "password",
+      "required": false
+    },
+    {
+      "name": "ocGotoPath",
+      "title": "oc-goto path",
+      "description": "Optional session jumper (opencode + herdr). Leave empty for ~/.local/bin/oc-goto; without it the list is Linear-only.",
+      "type": "textfield",
+      "required": false
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^2.10.1",
+    "@raycast/utils": "^2.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "build": "ray build -e dist",
+    "dev": "ray develop",
+    "publish": "ray publish"
+  },
+  "owner": "noahlabs",
+  "access": "private"
+}

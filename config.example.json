@@ -1,0 +1,8 @@
+{
+  "repo": "~/my-repo",
+  "githubRepo": "my-org/my-repo",
+  "worktreePrefix": "~/my-repo-",
+  "herdrWorkspace": "my-repo",
+  "terminalApp": "Ghostty",
+  "ticketKeys": ["ENG", "OPS"]
+}

@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# oc-goto — jump to the opencode session for a Linear ticket or GitHub PR, in its herdr pane.
+#   oc-goto [CORE-5114 | 16544 | #16544 | Linear URL | GitHub PR URL | branch name]   (default: clipboard)
+#   OC_GOTO_DRY_RUN=1 oc-goto …   print the herdr action instead of running it
+#   oc-goto --index               JSON {TICKET: {status, title, pane}} (Raycast "My Tickets" badges)
+#
+# | Found                            | Action                                                       |
+# |----------------------------------|--------------------------------------------------------------|
+# | opencode session in a herdr pane | herdr agent focus                                            |
+# | other agent pane titled with it  | herdr agent focus (e.g. Claude Code panes)                   |
+# | session, no live pane            | new herdr tab: opencode -s <id>                              |
+# | nothing (also not via its PR)    | new herdr tab: reuse or create the worktree, opencode + kickoff prompt |
+#
+# Config: ~/.config/oc-goto/config.json (see config.example.json). Needs jq, gh, herdr, opencode.
+#
+# Session match, strongest first: metadata.ticket/pr (set by ~/.config/opencode/plugins/ticket-tag.js)
+# or title, then the branch of the session's worktree; newest wins. The last output line is the Raycast HUD.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:$PATH"
+
+CONFIG="${OC_GOTO_CONFIG:-$HOME/.config/oc-goto/config.json}"
+[[ -f "$CONFIG" ]] || {
+  echo "No config at $CONFIG (run install.sh)"
+  exit 1
+}
+cfg() { jq -r --arg k "$1" '.[$k] // empty' "$CONFIG" | sed "s|^~|$HOME|"; }
+REPO="$(cfg repo)"
+GH_REPO="$(cfg githubRepo)"
+TERMINAL_APP="$(cfg terminalApp)"
+TERMINAL_APP="${TERMINAL_APP:-Ghostty}"
+WORKTREE_PREFIX="$(cfg worktreePrefix)"
+WORKTREE_PREFIX="${WORKTREE_PREFIX:-$REPO-}"
+HERDR_WORKSPACE="$(cfg herdrWorkspace)"
+
+# --new-worktree <dir> <branch>: run inside the new pane. Uses `wt` (deps cloned from a seed) when installed.
+if [[ "${1:-}" == "--new-worktree" ]]; then
+  dir="$2" branch="$3"
+  if command -v wt >/dev/null; then exec wt new "$dir" "$branch"; fi
+  git -C "$REPO" fetch --quiet origin
+  if git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+    exec git -C "$REPO" worktree add "$dir" "$branch"
+  elif git -C "$REPO" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    exec git -C "$REPO" worktree add --track -b "$branch" "$dir" "origin/$branch"
+  fi
+  exec git -C "$REPO" worktree add -b "$branch" "$dir" origin/HEAD
+fi
+
+upper() { tr '[:lower:]' '[:upper:]'; }
+lower() { tr '[:upper:]' '[:lower:]'; }
+fail() {
+  echo "$*"
+  exit 1
+}
+ticket_in() { # <branch-or-text> → KEY-123
+  [[ "$1" =~ (^|[/_])([A-Za-z][A-Za-z0-9]*)-([0-9]+)(-|$) ]] &&
+    echo "$(printf '%s' "${BASH_REMATCH[2]}" | upper)-${BASH_REMATCH[3]}"
+}
+
+REPO_WORKTREES() {
+  git -C "$REPO" worktree list --porcelain |
+    awk '/^worktree /{d=substr($0,10)} /^branch /{sub("refs/heads/","",$2); print d "\t" $2}'
+}
+
+# --index: JSON {"CORE-123"|"#16544": {status, title, pane}} for every ticket/PR with a session or agent pane.
+# status: herdr agent state (working|idle|done|blocked|unknown), or "parked" when no pane is open.
+if [[ "${1:-}" == "--index" ]]; then
+  sessions_file="$(mktemp -t oc-goto)"
+  trap 'rm -f "$sessions_file"' EXIT
+  opencode api get "/api/session?limit=500&parentID=null" >"$sessions_file"
+  jq -c --argjson agents "$(herdr agent list)" --arg wts "$(REPO_WORKTREES)" '
+    def tk: (try capture("(?<k>[A-Za-z][A-Za-z0-9]*-[0-9]+)").k catch null) | if . then ascii_upcase else null end;
+    def btk: (try capture("(^|/)(?<k>[A-Za-z][A-Za-z0-9]*-[0-9]+)(-|$)").k catch null) | if . then ascii_upcase else null end;
+    ($wts | split("\n") | map(select(. != "") | split("\t") | {key: .[0], value: (.[1] | btk)}) | from_entries) as $wt
+    | ($agents.result.agents) as $a
+    | def prk: (try capture("(PR\\s*#?|#)(?<p>[0-9]{4,6})\\b"; "i").p catch null) | if . then "#" + . else null end;
+    [.data[]
+     | (.title // "") as $title
+     | [.metadata.ticket // ($title | tk) // $wt[.location.directory // ""],
+        (if .metadata.pr then "#\(.metadata.pr)" else ($title | prk) end)] as $keys
+     | .id as $id | .time.updated as $updated
+     | ([$a[] | select(.agent_session.value == $id)][0]) as $p
+     | $keys[] | select(.)
+     | {ticket: ., title: $title, pane: $p.pane_id, status: ($p.agent_status // "parked"), updated: $updated}]
+    + [$a[] | select(.agent_session == null) | . as $p | (.terminal_title_stripped // "") as $x
+       | ($x | tk), ($x | prk) | select(.)
+       | {ticket: ., title: $x, pane: $p.pane_id, status: $p.agent_status, updated: 0}]
+    | group_by(.ticket)
+    | map(sort_by([(.pane != null), .updated]) | last | {key: .ticket, value: {status, title, pane}})
+    | from_entries' "$sessions_file"
+  exit 0
+fi
+
+input="${1:-}"
+[[ -n "$input" ]] || input="$(pbpaste)"
+input="$(printf '%s' "$input" | head -1 | tr -d '[:space:]')"
+[[ -n "$input" ]] || fail "Nothing to look up: pass a ticket/PR or copy one (Linear: ⌘.)"
+
+ticket="" pr="" pr_branch=""
+if [[ "$input" =~ github\.com/[^/]+/[^/]+/pull/([0-9]+) ]]; then
+  pr="${BASH_REMATCH[1]}"
+elif [[ "$input" =~ ^#?([0-9]{3,6})$ ]]; then
+  pr="${BASH_REMATCH[1]}"
+elif [[ "$input" =~ (^|[/_])([A-Za-z][A-Za-z0-9]*)-([0-9]+) ]]; then
+  ticket="$(printf '%s' "${BASH_REMATCH[2]}" | upper)-${BASH_REMATCH[3]}"
+else
+  fail "Not a ticket or PR: $input"
+fi
+if [[ -n "$pr" ]]; then
+  pr_branch="$(gh pr view "$pr" -R "$GH_REPO" --json headRefName -q .headRefName 2>/dev/null || true)"
+  ticket="$(ticket_in "$pr_branch" || true)"
+fi
+label="${ticket:-#$pr}"
+
+worktrees="$(REPO_WORKTREES)"
+
+# `opencode api` truncates large responses written to a pipe; a file gets the whole body.
+sessions_file="$(mktemp -t oc-goto)"
+trap 'rm -f "$sessions_file"' EXIT
+opencode api get "/api/session?limit=500&parentID=null" >"$sessions_file"
+agents="$(herdr agent list)"
+
+session="" pane=""
+find_target() { # sets session (JSON) and pane for the current ticket/pr/pr_branch
+  local dirs
+  dirs="$(while IFS=$'\t' read -r dir branch; do
+    if { [[ -n "$ticket" ]] && [[ "$(ticket_in "$branch" || true)" == "$ticket" ]]; } ||
+      { [[ -n "$pr_branch" ]] && [[ "$branch" == "$pr_branch" ]]; }; then
+      printf '%s\n' "$dir"
+    fi
+  done <<<"$worktrees")"
+
+  session="$(jq -c --arg t "$ticket" --arg p "$pr" --arg dirs "$dirs" '
+    ($dirs | split("\n") | map(select(. != ""))) as $wt
+    | def pr_in($x): $p != "" and ($x | test("(PR\\s*#?|#)" + $p + "\\b"; "i"));
+    [.data[]
+     | (.title // "") as $title
+     | (if ($t != "" and ((.metadata.ticket // "") == $t or ($title | ascii_upcase | contains($t))))
+           or ($p != "" and ((.metadata.pr // "") | tostring) == $p) or pr_in($title) then 2
+        elif (.location.directory // "") as $d | any($wt[]; . == $d) then 1
+        else 0 end) as $score
+     | select($score > 0)
+     | {id, title, directory: .location.directory, rank: [$score, .time.updated]}]
+    | sort_by(.rank) | last // empty' "$sessions_file")"
+
+  pane=""
+  if [[ -n "$session" ]]; then
+    pane="$(jq -r --arg s "$(jq -r .id <<<"$session")" \
+      '.result.agents[] | select(.agent_session.value == $s) | .pane_id' <<<"$agents" | head -1)"
+  fi
+  # Agents herdr cannot map to an opencode session (Claude Code, Codex…) still show their task in the title.
+  if [[ -z "$pane" ]]; then
+    pane="$(jq -r --arg t "$ticket" --arg p "$pr" '
+      .result.agents[]
+      | select((.terminal_title_stripped // "") as $x
+          | ($t != "" and ($x | ascii_upcase | contains($t))) or ($p != "" and ($x | test("(PR\\s*#?|#)" + $p + "\\b"; "i"))))
+      | .pane_id' <<<"$agents" | head -1)"
+  fi
+}
+
+find_target
+issue=""
+if [[ -z "$session" && -z "$pane" && -n "$ticket" && -z "$pr" ]]; then
+  # The work may be tracked under the ticket's PR (e.g. a "PR #16592" pane).
+  [[ -n "${LINEAR_API_KEY:-}" ]] || fail "LINEAR_API_KEY is not set"
+  issue="$(curl -fsS https://api.linear.app/graphql -H "Authorization: $LINEAR_API_KEY" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg id "$ticket" '{query: "query($id:String!){ issue(id:$id){ title branchName url } }", variables: {id: $id}}')" |
+    jq -c '.data.issue // empty')"
+  [[ -n "$issue" ]] || fail "Linear has no $ticket"
+  pr_branch="$(jq -r .branchName <<<"$issue")"
+  pr="$(gh pr list -R "$GH_REPO" --head "$pr_branch" --state all --json number -q '.[0].number // empty' 2>/dev/null || true)"
+  [[ -n "$pr" ]] && find_target
+fi
+
+if [[ -n "${OC_GOTO_DRY_RUN:-}" ]]; then
+  herdr() { echo "[dry-run] herdr $*" >&2; [[ "$1 $2" == "tab create" ]] && echo '{"result":{"root_pane":{"pane_id":"dry"}}}'; true; }
+  open() { :; }
+fi
+
+if [[ -n "$pane" ]]; then
+  herdr agent focus "$pane" >/dev/null
+  open -a "$TERMINAL_APP"
+  echo "→ $(if [[ -n "$session" ]]; then jq -r .title <<<"$session"; else echo "$label (agent pane)"; fi)"
+  exit 0
+fi
+
+workspace="$(herdr workspace list | jq -r '
+  .result.workspaces as $w
+  | (($w[] | select(.label == $ARGS.named.ws)) // ($w[] | select(.focused)) // $w[0]) | .workspace_id' --arg ws "$HERDR_WORKSPACE" | head -1)"
+open_tab() { # <cwd> <command> [KEY=VALUE env]
+  local root
+  root="$(herdr tab create --workspace "$workspace" --cwd "$1" --label "$label" --focus ${3:+--env "$3"} |
+    jq -r .result.root_pane.pane_id)"
+  herdr pane run "$root" "$2" >/dev/null
+  open -a "$TERMINAL_APP"
+}
+
+if [[ -n "$session" ]]; then
+  open_tab "$(jq -r .directory <<<"$session")" "opencode -s $(jq -r .id <<<"$session")"
+  echo "↻ resumed $(jq -r .title <<<"$session")"
+  exit 0
+fi
+
+# No session yet: find or create the worktree, then start one.
+title="" url=""
+if [[ -n "$ticket" ]]; then
+  [[ -n "$issue" ]] || issue="$(curl -fsS https://api.linear.app/graphql -H "Authorization: ${LINEAR_API_KEY:?}" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg id "$ticket" '{query: "query($id:String!){ issue(id:$id){ title branchName url } }", variables: {id: $id}}')" |
+    jq -c '.data.issue // empty')"
+  [[ -n "$issue" ]] || fail "Linear has no $ticket"
+  title="$(jq -r .title <<<"$issue")"
+  url="$(jq -r .url <<<"$issue")"
+  [[ -n "$pr_branch" ]] || pr_branch="$(jq -r .branchName <<<"$issue")"
+fi
+branch="$pr_branch"
+[[ -n "$branch" ]] || fail "No branch found for $label"
+[[ -n "$pr" ]] && url="${url:+$url and }https://github.com/$GH_REPO/pull/$pr"
+
+# Passed through the tab's env so ticket titles need no shell quoting.
+prompt="OC_PROMPT=Context: $label${title:+ - $title} ($url). Read it and summarise where things stand, then wait for instructions before changing code."
+existing="$(awk -F'\t' -v b="$branch" '$2 == b {print $1}' <<<"$worktrees" | head -1)"
+if [[ -n "$existing" ]]; then
+  # shellcheck disable=SC2016 # expands in the new pane
+  open_tab "$existing" 'opencode --prompt "$OC_PROMPT"' "$prompt"
+  echo "✚ new session in $(basename "$existing")"
+else
+  if [[ -n "$ticket" ]]; then dir="$WORKTREE_PREFIX$(printf '%s' "$ticket" | lower)"; else dir="${WORKTREE_PREFIX}pr$pr"; fi
+  open_tab "$REPO" "oc-goto --new-worktree $dir $branch && cd $dir && opencode --prompt \"\$OC_PROMPT\"" "$prompt"
+  echo "✚ creating worktree $(basename "$dir")"
+fi
