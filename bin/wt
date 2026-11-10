@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# wt — git worktrees whose dependencies are APFS clones of a clean seed install.
+# Run `wt` with no arguments for usage.
+set -euo pipefail
+
+ROOT="${WT_ROOT:-$HOME}"
+CONFIG="${OC_GOTO_CONFIG:-$HOME/.config/oc-goto/config.json}"
+
+die() {
+  echo "wt: $*" >&2
+  exit 1
+}
+log() { echo "wt: $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+wt new <dir> <branch> [base]   add worktree <dir> (under WT_ROOT, or an absolute path) on <branch>
+                               (existing local/remote branch, else new from base, default origin/HEAD),
+                               clone deps from the seed, yarn install
+wt deps <dir>                  replace <dir>'s deps with clones of the seed's, then yarn install
+wt install <dir>               yarn install, skipped when lockfile, rc, root package.json and patches match the seed
+wt seed                        move the seed to origin/HEAD and reinstall its deps from scratch
+wt du                          apparent size of every worktree, and the volume's free space
+
+Env: WT_ROOT (default ~), WT_REPO (default: the oc-goto config's repo, else the current repo),
+     WT_SEED (default <repo>-deps-seed), WT_NO_INSTALL=1.
+EOF
+}
+
+[[ "$(uname -s)" == Darwin ]] || die "wt needs macOS: dependency clones use APFS clonefile"
+
+main_checkout() {
+  local common
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  [[ "$(basename "$common")" == .git ]] && dirname "$common"
+}
+
+config_repo() {
+  { [[ -f "$CONFIG" ]] && command -v jq >/dev/null; } || return 0
+  jq -r '.repo // empty' "$CONFIG" 2>/dev/null | sed "s|^~|$HOME|"
+}
+
+REPO="${WT_REPO:-$(config_repo)}"
+REPO="${REPO:-$(main_checkout)}"
+[[ -n "$REPO" ]] || die "no repo: set WT_REPO, run oc-goto's install.sh, or run wt inside the repo"
+[[ -e "$REPO/.git" ]] || die "WT_REPO $REPO is not a git checkout"
+SEED="${WT_SEED:-${REPO}-deps-seed}"
+
+abs_dir() {
+  local path="${1/#\~/$HOME}"
+  if [[ "$path" == /* ]]; then
+    echo "$path"
+  elif [[ -e "$path" ]]; then
+    (cd "$path" && pwd -P)
+  else
+    echo "$ROOT/$path"
+  fi
+}
+
+# Dependency paths relative to a worktree root: every node_modules not nested in another, plus Yarn's cache and state.
+dep_paths() {
+  (cd "$1" && {
+    find . \( -path ./.git -o -path ./.nx -o -path ./tmp \) -prune -o -name node_modules -type d -prune -print
+    [[ -d .yarn/cache ]] && echo ./.yarn/cache
+    [[ -f .yarn/install-state.gz ]] && echo ./.yarn/install-state.gz
+  }) | sed 's|^\./||' | sort
+}
+
+clone_deps() {
+  local dest="$1" rel n=0
+  [[ -d "$SEED/node_modules" ]] || die "no seed at $SEED; run: wt seed"
+  [[ "$(cd "$dest" && pwd -P)" != "$(cd "$SEED" && pwd -P)" ]] || die "refusing to clone deps onto the seed itself"
+  while IFS= read -r rel; do rm -rf "${dest:?}/$rel"; done < <(dep_paths "$dest")
+  while IFS= read -r rel; do
+    [[ -d "$dest/$(dirname "$rel")" ]] || continue
+    cp -c -R -p "$SEED/$rel" "$dest/$rel"
+    n=$((n + 1))
+  done < <(dep_paths "$SEED")
+  log "cloned $n dependency paths from $SEED"
+}
+
+install_inputs() {
+  (cd "$1" && cat yarn.lock .yarnrc.yml package.json .yarn/patches/* 2>/dev/null) | shasum | cut -c1-40
+}
+
+yarn_install() {
+  [[ "${WT_NO_INSTALL:-}" == 1 ]] && {
+    log "WT_NO_INSTALL=1, skipping yarn install"
+    return
+  }
+  if [[ "$(install_inputs "$1")" == "$(install_inputs "$SEED")" ]]; then
+    log "install inputs match the seed; skipping yarn install"
+    return
+  fi
+  (cd "$1" && yarn install)
+}
+
+cmd_new() {
+  local dir="${1:-}" branch="${2:-}" base="${3:-origin/HEAD}"
+  [[ -n "$dir" && -n "$branch" ]] || die "usage: wt new <dir> <branch> [base]"
+  local dest
+  dest=$(abs_dir "$dir")
+  [[ -e "$dest" ]] && die "$dest already exists"
+
+  git -C "$REPO" fetch --quiet origin
+  if git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$REPO" worktree add "$dest" "$branch"
+  elif git -C "$REPO" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$REPO" worktree add --track -b "$branch" "$dest" "origin/$branch"
+  else
+    git -C "$REPO" worktree add --no-track -b "$branch" "$dest" "$base"
+  fi
+
+  clone_deps "$dest"
+  yarn_install "$dest"
+  log "ready: $dest"
+}
+
+worktree_dir() {
+  [[ -n "${1:-}" ]] || die "usage: wt $2 <dir|absolute path>"
+  local dest
+  dest=$(abs_dir "$1")
+  git -C "$dest" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$dest is not a git worktree"
+  echo "$dest"
+}
+
+cmd_deps() {
+  local dest
+  dest=$(worktree_dir "${1:-}" deps)
+  clone_deps "$dest"
+  yarn_install "$dest"
+}
+
+cmd_install() {
+  local dest
+  dest=$(worktree_dir "${1:-}" install)
+  yarn_install "$dest"
+}
+
+cmd_seed() {
+  git -C "$REPO" fetch --quiet origin
+  if [[ -d "$SEED" ]]; then
+    git -C "$SEED" checkout --quiet --detach origin/HEAD
+  else
+    git -C "$REPO" worktree add --detach "$SEED" origin/HEAD
+  fi
+  local rel
+  while IFS= read -r rel; do rm -rf "${SEED:?}/$rel"; done < <(dep_paths "$SEED")
+  (cd "$SEED" && yarn install)
+  log "seed at $(git -C "$SEED" rev-parse --short HEAD)"
+}
+
+# du counts APFS clones at full size; the volume's free space is the real measure.
+cmd_du() {
+  local path
+  git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r path; do
+    printf '%-60s %s\n' "$(basename "$path")" "$(du -sh "$path" 2>/dev/null | cut -f1) apparent"
+  done
+  df -h "$ROOT" | tail -1 | awk '{print "volume free: " $4}'
+}
+
+case "${1:-}" in
+  new)
+    shift
+    cmd_new "$@"
+    ;;
+  deps)
+    shift
+    cmd_deps "$@"
+    ;;
+  install)
+    shift
+    cmd_install "$@"
+    ;;
+  seed)
+    shift
+    cmd_seed "$@"
+    ;;
+  du)
+    shift
+    cmd_du "$@"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

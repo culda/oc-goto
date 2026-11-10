@@ -13,6 +13,7 @@ flowchart LR
 |---|---|
 | `opencode/ticket-tag.js` | Tags each session with its Linear ticket and PR: `metadata.ticket/pr` plus a title prefix `CORE-123 #4567 · …` |
 | `bin/oc-goto` | Ticket/PR/URL/branch (or clipboard) → focus the session's herdr pane; resume it in a new tab; or create the worktree and start a session |
+| `bin/wt` | Optional: new worktrees whose `node_modules` are APFS clones of a seed checkout, so the worktree is ready in seconds |
 | `raycast/script-commands/go-to-session.sh` | Raycast command wrapping `oc-goto` |
 | `raycast/my-tickets` | Raycast extension: your Linear issues with session status badges, ↵ jumps to the session |
 
@@ -55,6 +56,25 @@ git clone https://github.com/culda/oc-goto ~/oc-goto
 New worktrees use `wt new <dir> <branch>` when a `wt` command is on PATH, else `git worktree add`.
 
 Raycast: add `~/.config/raycast/script-commands` under Settings → Extensions → Script Commands, or install **My Tickets** (`cd raycast/my-tickets && npm install && npm run dev`).
+
+## Worktrees with cloned dependencies
+
+`bin/wt` (macOS, APFS) creates the worktree and fills `node_modules`, Yarn's cache and install state from a clean seed checkout using clonefile, then runs `yarn install` only when the lockfile, `.yarnrc.yml`, root `package.json` or patches differ from the seed.
+
+| Command | Effect |
+|---|---|
+| `wt seed` | create or refresh the seed (default `<repo>-deps-seed`) at `origin/HEAD`, with a full install |
+| `wt new <dir> <branch> [base]` | worktree on an existing local/remote branch, else a new branch from `base` (default `origin/HEAD`); deps cloned, install only if needed |
+| `wt deps <dir>` | re-clone deps for an existing worktree |
+| `wt install <dir>` | install only if the install inputs differ from the seed |
+| `wt du` | apparent size per worktree and free space on the volume |
+
+The repo comes from `WT_REPO`, else the oc-goto config's `repo`, else the repo you run `wt` in. Override `WT_ROOT` (default `~`) and `WT_SEED`, or set `WT_NO_INSTALL=1` to skip installs.
+
+```sh
+wt seed                      # once, then after lockfile changes
+wt new ~/my-repo-eng-123 eng-123
+```
 
 ## Debugging
 

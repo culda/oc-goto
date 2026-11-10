@@ -22,6 +22,7 @@ link() { # <source> <target>
   echo "linked $2"
 }
 link "$SRC/bin/oc-goto" "$HOME/.local/bin/oc-goto"
+link "$SRC/bin/wt" "$HOME/.local/bin/wt"
 link "$SRC/opencode/ticket-tag.js" "$HOME/.config/opencode/plugins/ticket-tag.js"
 link "$SRC/raycast/script-commands/go-to-session.sh" "$HOME/.config/raycast/script-commands/go-to-session.sh"
 
